@@ -1,5 +1,22 @@
 #![no_std]
-use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, Vec, Symbol, token};
+use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Env, Symbol, token};
+
+// --- ERROR CODES ---
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    NotInitialized = 1,
+    AlreadyInitialized = 2,
+    Unauthorized = 3,
+    CircleNotFound = 4,
+    CircleFull = 5,
+    UserAlreadyInCircle = 6,
+    UserNotInCircle = 7,
+    InsufficientBalance = 8,
+    NoPendingRequest = 9,
+}
 
 // --- DATA STRUCTURES ---
 
@@ -10,16 +27,13 @@ pub enum DataKey {
     Circle(u64),
     Member(Address),
     CircleCount,
-    // Tracks if a user has paid for a specific circle (CircleID, UserAddress)
     Deposit(u64, Address),
-    // Early payout requests
     EarlyPayoutRequest(u64, Address),
-    // Tracks Group Reserve balance for penalties
     GroupReserve,
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Member {
     pub address: Address,
     pub has_contributed: bool,
@@ -28,7 +42,7 @@ pub struct Member {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CircleInfo {
     pub id: u64,
     pub creator: Address,
@@ -42,7 +56,10 @@ pub struct CircleInfo {
     pub cycle_duration: u64,
 }
 
-// --- EVENTS MODULE ---
+// --- CONSTANTS ---
+const PENALTY_BPS: i128 = 100; // 1% = 100 Basis Points
+
+// --- EVENTS ---
 
 mod events {
     use soroban_sdk::{Symbol, Address, Env};
@@ -63,38 +80,56 @@ mod events {
     }
 }
 
-// --- CONTRACT TRAIT ---
+// --- HELPERS ---
 
-pub trait SoroSusuTrait {
-    fn init(env: Env, admin: Address);
-    fn create_circle(env: Env, creator: Address, amount: i128, max_members: u32, token: Address, cycle_duration: u64) -> u64;
-    fn join_circle(env: Env, user: Address, circle_id: u64);
-    fn deposit(env: Env, user: Address, circle_id: u64);
-    fn request_early_payout(env: Env, user: Address, circle_id: u64);
-    fn approve_early_payout(env: Env, admin: Address, circle_id: u64, user: Address);
+fn get_admin(env: &Env) -> Result<Address, Error> {
+    env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)
 }
 
-// --- IMPLEMENTATION ---
+fn get_circle(env: &Env, id: u64) -> Result<CircleInfo, Error> {
+    env.storage().instance().get(&DataKey::Circle(id)).ok_or(Error::CircleNotFound)
+}
+
+fn get_member(env: &Env, user: &Address) -> Result<Member, Error> {
+    env.storage().instance().get(&DataKey::Member(user.clone())).ok_or(Error::UserNotInCircle)
+}
+
+// --- CONTRACT ---
 
 #[contract]
 pub struct SoroSusu;
 
 #[contractimpl]
-impl SoroSusuTrait for SoroSusu {
-    fn init(env: Env, admin: Address) {
-        if !env.storage().instance().has(&DataKey::CircleCount) {
-            env.storage().instance().set(&DataKey::CircleCount, &0u64);
+impl SoroSusu {
+    /// Initialize the ROSCA contract with an admin.
+    pub fn init(env: Env, admin: Address) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::AlreadyInitialized);
         }
+        
+        env.storage().instance().set(&DataKey::CircleCount, &0u64);
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::GroupReserve, &0i128);
+        Ok(())
     }
 
-    fn create_circle(env: Env, creator: Address, amount: i128, max_members: u32, token: Address, cycle_duration: u64) -> u64 {
-        let mut circle_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
-        circle_count += 1;
+    /// Create a new savings circle.
+    pub fn create_circle(
+        env: Env, 
+        creator: Address, 
+        amount: i128, 
+        max_members: u32, 
+        token: Address, 
+        cycle_duration: u64
+    ) -> Result<u64, Error> {
+        creator.require_auth();
+
+        let mut count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
+        count += 1;
 
         let current_time = env.ledger().timestamp();
-        let new_circle = CircleInfo {
-            id: circle_count,
+        let circle = CircleInfo {
+            id: count,
             creator: creator.clone(),
             contribution_amount: amount,
             max_members,
@@ -106,101 +141,122 @@ impl SoroSusuTrait for SoroSusu {
             cycle_duration,
         };
 
-        env.storage().instance().set(&DataKey::Circle(circle_count), &new_circle);
-        env.storage().instance().set(&DataKey::CircleCount, &circle_count);
+        env.storage().instance().set(&DataKey::Circle(count), &circle);
+        env.storage().instance().set(&DataKey::CircleCount, &count);
 
-        if !env.storage().instance().has(&DataKey::GroupReserve) {
-            env.storage().instance().set(&DataKey::GroupReserve, &0i128);
-        }
-
-        events::group_created(&env, circle_count, creator, amount);
-
-        circle_count
+        events::group_created(&env, count, creator, amount);
+        Ok(count)
     }
 
-    fn join_circle(env: Env, user: Address, circle_id: u64) {
+    /// Join a savings circle.
+    pub fn join_circle(env: Env, user: Address, circle_id: u64) -> Result<(), Error> {
         user.require_auth();
-        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
 
+        let mut circle = get_circle(&env, circle_id)?;
         if circle.member_count >= circle.max_members {
-            panic!("Circle is full");
+            return Err(Error::CircleFull);
         }
 
         let member_key = DataKey::Member(user.clone());
         if env.storage().instance().has(&member_key) {
-            panic!("User is already a member");
+            return Err(Error::UserAlreadyInCircle);
         }
 
-        let new_member = Member {
+        let member = Member {
             address: user.clone(),
             has_contributed: false,
             contribution_count: 0,
             last_contribution_time: 0,
         };
         
-        env.storage().instance().set(&member_key, &new_member);
+        env.storage().instance().set(&member_key, &member);
+        
         circle.member_count += 1;
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+        
+        Ok(())
     }
 
-    fn deposit(env: Env, user: Address, circle_id: u64) {
+    /// Deposit funds into a circle. Applies 1% penalty if late.
+    pub fn deposit(env: Env, user: Address, circle_id: u64) -> Result<(), Error> {
         user.require_auth();
-        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
 
-        let member_key = DataKey::Member(user.clone());
-        let mut member: Member = env.storage().instance().get(&member_key)
-            .unwrap_or_else(|| panic!("User is not a member of this circle"));
+        let mut circle = get_circle(&env, circle_id)?;
+        let mut member = get_member(&env, &user)?;
 
         let client = token::Client::new(&env, &circle.token);
         let current_time = env.ledger().timestamp();
 
-        let mut total_amount = circle.contribution_amount;
+        let mut final_amount = circle.contribution_amount;
+        
+        // Late penalty logic (1%)
         if current_time > circle.deadline_timestamp {
-            let penalty_amount = circle.contribution_amount / 100;
-            let mut reserve_balance: i128 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
-            reserve_balance += penalty_amount;
-            env.storage().instance().set(&DataKey::GroupReserve, &reserve_balance);
-            total_amount += penalty_amount;
+            let penalty = circle.contribution_amount / (10000 / PENALTY_BPS);
+            let mut reserve: i128 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
+            reserve += penalty;
+            env.storage().instance().set(&DataKey::GroupReserve, &reserve);
+            final_amount += penalty;
         }
 
-        client.transfer(&user, &env.current_contract_address(), &total_amount);
+        client.transfer(&user, &env.current_contract_address(), &final_amount);
 
+        // Update member state
         member.has_contributed = true;
         member.contribution_count += 1;
         member.last_contribution_time = current_time;
-        env.storage().instance().set(&member_key, &member);
+        env.storage().instance().set(&DataKey::Member(user.clone()), &member);
 
+        // Update circle deadline for next cycle
         circle.deadline_timestamp = current_time + circle.cycle_duration;
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
 
+        // Track deposit for payout logic
         env.storage().instance().set(&DataKey::Deposit(circle_id, user.clone()), &true);
 
         events::deposit(&env, user, circle.contribution_amount, current_time);
+        Ok(())
     }
 
-    fn request_early_payout(env: Env, user: Address, circle_id: u64) {
+    /// Request an emergency early payout.
+    pub fn request_early_payout(env: Env, user: Address, circle_id: u64) -> Result<(), Error> {
         user.require_auth();
-        if !env.storage().instance().has(&DataKey::EarlyPayoutRequest(circle_id, user.clone())) {
-            env.storage().instance().set(&DataKey::EarlyPayoutRequest(circle_id, user), &true);
-        }
+        let _ = get_circle(&env, circle_id)?;
+        let _ = get_member(&env, &user)?;
+
+        env.storage().instance().set(&DataKey::EarlyPayoutRequest(circle_id, user), &true);
+        Ok(())
     }
 
-    fn approve_early_payout(env: Env, admin: Address, circle_id: u64, user: Address) {
+    /// Approve an early payout (Admin Only).
+    pub fn approve_early_payout(env: Env, admin: Address, circle_id: u64, user: Address) -> Result<(), Error> {
         admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != stored_admin { panic!("Not authorized"); }
-
-        if env.storage().instance().has(&DataKey::EarlyPayoutRequest(circle_id, user.clone())) {
-            let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
-            let client = token::Client::new(&env, &circle.token);
-            let payout_amount = circle.contribution_amount * (circle.member_count as i128);
-            
-            client.transfer(&env.current_contract_address(), &user, &payout_amount);
-
-            events::payout(&env, user.clone(), payout_amount, 1);
-            
-            env.storage().instance().remove(&DataKey::EarlyPayoutRequest(circle_id, user));
+        
+        let stored_admin = get_admin(&env)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
         }
+
+        let request_key = DataKey::EarlyPayoutRequest(circle_id, user.clone());
+        if !env.storage().instance().has(&request_key) {
+            return Err(Error::NoPendingRequest);
+        }
+
+        let circle = get_circle(&env, circle_id)?;
+        let client = token::Client::new(&env, &circle.token);
+        
+        // Calculate pot: contribution * members
+        let payout_amount = circle.contribution_amount * (circle.member_count as i128);
+        
+        client.transfer(&env.current_contract_address(), &user, &payout_amount);
+
+        events::payout(&env, user.clone(), payout_amount, 1);
+        
+        env.storage().instance().remove(&request_key);
+        Ok(())
+    }
+
+    /// Administrative: Get the group reserve balance.
+    pub fn get_reserve(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0)
     }
 }
-// Issue #4: Standardize Soroban Events for Indexing
